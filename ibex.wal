@@ -1,0 +1,45 @@
+;; Check if program was passed requried arguments
+(when (< (length args) 1)
+    (print "Usage: wal ibex.wal {trace}")
+    (exit 1))
+
+;; Define a few aliases to improve readability
+(alias clk TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.clk_i)
+(alias rst TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.rst_ni)
+(alias ready TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.ready_i)
+(alias valid TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.valid_o)
+(alias isbranch TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.branch_i)
+(alias addr TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.addr_o)
+(alias instr-req TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.instr_req_o)
+(alias instr-gnt TOP.ibex_simple_system.u_top.u_ibex_top.u_ibex_core.if_stage_i.gen_icache.icache_i.instr_gnt_i)
+
+;; Define when signals are sampled
+(defmacro cache-sampling [] '(rising clk))
+;; Defines condition to match a new request
+(defmacro cache-request []
+  '(&& ready
+       (! (&& ready (= 0 valid isbranch))@-1)))
+
+;; Define condition on which requests are dropped
+(defmacro cache-request-drop [] #f)
+;; Define condition when requests are acknowledged
+(defmacro cache-response []
+  '(&& ready valid))
+
+(use cache-analysis)
+
+;; Define a new metric to track how much of the trace was analyzed
+(define-cache-metric progress
+  (define-callback progress []
+    (when (= (floor (mod INDEX 200)) 0)
+      (printf "%d%%\n" (* 100 (/ INDEX MAX-INDEX))))))
+
+;; Define the list of metrics we want to analyze
+(define callbacks (list progress cache/average-delay cache/average-miss-delay cache/hit-rate))
+;; load the waveform
+(load (first args))
+;; skip until reset is done
+(step-until (rising rst))
+;; Analyze specified callbacks
+(define results (analyze-cache callbacks 0 MAX-INDEX))
+(print results)

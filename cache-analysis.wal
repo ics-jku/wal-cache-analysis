@@ -1,0 +1,203 @@
+(defmacro define-callback args
+  (define name (first args))
+  (define params (second args))
+  (define body (rest (rest args)))
+  `(define ,name (lambda ,params ,@body)))
+
+(defmacro define-cache-metric body
+    (define name body[0])
+    (define extra-functions
+      (filter (fn [x] x)
+        (for/list [expr (rest body)]
+          (if (&& (list? expr)
+                  (> (length expr) 2)
+                  (= (first expr) 'define-callback)
+                  (! (in (second expr) '(on-response on-drop final))))
+              (list (symbol->string (second expr)) (second expr))
+              #f))))
+    `(define ,name
+       (let ()
+         ,@(rest body)
+         (define obj
+           (array ["name" ,(symbol->string name)]
+                ["extra" (array ,@extra-functions)]))
+         (when (defined? 'on-response)
+               (seta obj "on-response" on-response))
+         (when (defined? 'on-drop)
+               (seta obj "on-drop" on-drop))
+         (when (defined? 'final)
+               (seta obj "final" final))
+         obj)))
+
+(module cache-analysis
+  (defun analyze-cache [metrics time-start time-end]
+       (step time-start)
+       (define req-time INDEX)
+       ;; Flatten all extra callbacks into a list
+       (define extra-callbacks
+         (fold (fn [acc x] (+ acc x)) '()
+           (for/list [metric metrics]
+             (mapa (fn [name func] func) (geta metric "extra")))))
+
+       (while (<= INDEX time-end)
+          (when (cache-sampling)
+            (unless (cache-request)
+              (for [callback extra-callbacks] (callback)))
+            (when (cache-request)
+              (set! req-time INDEX)
+
+              (for [metric metrics]
+                   (when (in "on-request" metric)
+                         ((geta metric "on-request") req-time)))
+
+              (step-until (do (for [callback extra-callbacks] (callback))
+                              (|| (cache-response)
+                                  (cache-request-drop))))
+                 (cond
+                   [(= INDEX MAX-INDEX) #f]
+                   [(cache-response)
+                    (for [metric metrics]
+                       (when (in "on-response" metric)
+                         ((geta metric "on-response") req-time INDEX time-end)))]
+                   [(cache-request-drop)
+                    (for [metric metrics]
+                       (when (in "on-drop" metric)
+                         ((geta metric "on-drop") req-time INDEX time-end)))])))
+           ;; if we reached the end of the trace stop
+           (unless (step) (set! time-end 0)))
+
+       ;; call finalization functions and collect results
+       (for/list [metric metrics]
+                 (when (in "final" metric)
+                   (list (geta metric "name")
+                         ((geta metric "final"))))))
+  ;; Hit-Miss rate
+  (define-cache-metric cache/hit-rate
+    (define requests 0)
+    (define hits 0)
+    (defun on-response [req-time resp-time d]
+      (inc requests)
+      (when (= (- resp-time req-time) 0)
+        (inc hits)))
+    (defun final []
+      (if requests
+          (/ hits requests)
+          "no requests")))
+
+  ;; Average delay
+  (define-cache-metric cache/average-delay
+    (define responses 0)
+    (define acc-delay 0)
+    (define-callback on-response [req rsp end]
+      (inc responses)
+      (set! acc-delay (+ acc-delay (- rsp req))))
+    (defun final []
+      (if responses
+          (/ acc-delay responses)
+          "no requests")))
+
+  ;; Average delay of misses
+  (define-cache-metric cache/average-miss-delay
+    (define responses 0)
+    (define acc-delay 0)
+    (define-callback on-response [req rsp end]
+      (when (!= req rsp)
+        (inc responses))
+      (set! acc-delay (+ acc-delay (- rsp req))))
+    (defun final []
+      (if responses
+          (/ acc-delay responses)
+          "no requests")))
+
+  ;; Parallel-ready version of the average-delay metric
+  (define-cache-metric cache/average-delay/parallel
+    (define responses 0)
+    (define acc-delay 0)
+    (defun on-response [req rsp end]
+      (when (<= rsp end)
+            (inc responses))
+      (set! acc-delay (+ acc-delay (- rsp req))))
+    (defun final []
+      (list acc-delay responses)))
+
+  ;; Collect delays
+  (define-cache-metric cache/delays-by-time
+    (define delays (array))
+    (defun on-response [s n d]
+       (seta delays s d))
+    (defun final [] delays))
+
+  ;; Calculate buckets
+  (define-cache-metric cache/delay-buckets
+    (define buckets (array))
+
+    (defun on-response [req-time resp-time d]
+      (define delay (- resp-time req-time))
+      (seta buckets
+            delay
+            (+ 1 (geta/default buckets 0 delay))))
+
+    (defun final [] buckets))
+
+  ;; Print all requests
+  (define-cache-metric cache/print
+      (defun on-response [req res end]
+           (print TS@(- (- res req)) " -> " TS "  (" (- res req) ")")))
+
+  (define-cache-metric cache/print-misses
+        (defun on-response [req res end]
+             (when (- res req)
+               (print TS@(- (- res req)) " -> " TS "  (" (- res req) ")"))))
+
+  (define window-size 4000)
+  (define-cache-metric cache/sliding-window
+      (define delays (array))
+      (define window-start 0)
+      (define window '())
+      (define res '())
+      (define-callback collect []
+        (unless (cache-request)
+          (set! window (+ window 0)))
+        (when (> (length window) window-size)
+          (set! res (append res (list window-start (average window))))
+          (set! window-start TS)
+          (set! window '())))
+
+      (define-callback on-response [req resp end]
+         (set! window (+ window (- resp req))))
+      (defun final [] res))
+
+  ;; Average delay per function
+  ; Exemplary values
+  ; (define elf-functions
+  ;   '(("main" 644 768)
+  ;     ("memcpy" 768 892)
+  ;     ("print_array" 24 180)
+  ;     ("printf" 1324 1716)
+  ;     ("print_str" 180 260)
+  ;     ("putchar" 892 948)
+  ;     ("sort" 260 644)))
+
+  (define-cache-metric cache/function-delays
+    (define functions (array))
+    (defun on-response [s n d]
+      (for [f-range elf-functions]
+           (when (&& (>= (cache-addr) f-range[1])
+                     (<= (cache-addr) f-range[2]))
+             (define row (geta/default functions '(0 0 0) f-range[0]))
+             (seta functions f-range[0]
+                   (list (+ row[0] 1) (+ row[1] d))))))
+    (defun final []
+      (mapa (fn [key value] (list key (/ value[1] value[0]))) functions)))
+
+  (provide analyze-cache
+           cache/hit-rate
+           cache/average-delay
+           cache/average-miss-delay
+           cache/average-delay/parallel
+           cache/delay-buckets
+           cache/delays-by-time
+           cache/function-delays
+           cache/sliding-window
+           cache/print
+           cache/print-misses))
